@@ -357,34 +357,50 @@ static NO_INLINE JsVar *jswrap_crypto_AEScrypt(JsVar *message, JsVar *key, JsVar
   }
 
 
-
-  mbedtls_aes_context aes;
-  mbedtls_aes_init( &aes );
-
   JSV_GET_AS_CHAR_ARRAY(messagePtr, messageLen, message);
   if (!messagePtr) return 0;
 
   JSV_GET_AS_CHAR_ARRAY(keyPtr, keyLen, key);
   if (!keyPtr) return 0;
 
-  if (encrypt)
-    err = mbedtls_aes_setkey_enc( &aes, (unsigned char*)keyPtr, (unsigned int)keyLen*8 );
-  else
-    err = mbedtls_aes_setkey_dec( &aes, (unsigned char*)keyPtr, (unsigned int)keyLen*8 );
-  if (err) {
-    jswrap_crypto_error(err);
-    return 0;
+
+  mbedtls_gcm_context aes_gcm;
+  mbedtls_aes_context aes;
+  
+  char *outPtr = 0;
+  JsVar *outVar;
+  if(mode == CM_GCM){
+    
+    #define TAGSIZE 16
+    mbedtls_gcm_init( &aes_gcm );
+    
+    err = mbedtls_gcm_setkey( &aes_gcm, MBEDTLS_CIPHER_ID_AES , (unsigned char*)keyPtr, (unsigned int)keyLen*8);
+    if (err) {
+      jswrap_crypto_error(err);
+      return 0;
+    }
+    
+    outVar = jsvNewArrayBufferWithPtr(encrypt ? (unsigned int) messageLen + TAGSIZE : (unsigned int) messageLen - TAGSIZE, &outPtr);
+  
+  }else{
+    mbedtls_aes_init( &aes );
+    
+    if (encrypt)
+      err = mbedtls_aes_setkey_enc( &aes, (unsigned char*)keyPtr, (unsigned int)keyLen*8 );
+    else
+      err = mbedtls_aes_setkey_dec( &aes, (unsigned char*)keyPtr, (unsigned int)keyLen*8 );
+    if (err) {
+      jswrap_crypto_error(err);
+      return 0;
+    }
+    outVar = jsvNewArrayBufferWithPtr((unsigned int) messageLen, &outPtr);
   }
 
-  char *outPtr = 0;
-  JsVar *outVar = jsvNewArrayBufferWithPtr((unsigned int)messageLen, &outPtr);
   if (!outPtr) {
     jsError("Not enough memory for result");
     return 0;
   }
-
-
-
+  
   switch (mode) {
   case CM_CBC:
     err = mbedtls_aes_crypt_cbc( &aes,
@@ -428,12 +444,55 @@ static NO_INLINE JsVar *jswrap_crypto_AEScrypt(JsVar *message, JsVar *key, JsVar
     }
     break;
   }
+  
+  case CM_GCM: {
+    
+    char msgtag[TAGSIZE];
+    unsigned char add[0] = {} ;//need to add additionalData
+    unsigned char input[encrypt ? (unsigned int) messageLen + TAGSIZE : (unsigned int) messageLen - TAGSIZE];
+    unsigned char output[!encrypt ? (unsigned int) messageLen + TAGSIZE : (unsigned int) messageLen - TAGSIZE];
+    memcpy(input,  messagePtr, sizeof(input));
+    if(!encrypt){
+      memcpy(msgtag, &messagePtr[sizeof(input)], TAGSIZE);
+      err = mbedtls_gcm_auth_decrypt(&aes_gcm,
+        sizeof(input),
+        iv, 
+        sizeof(iv),
+        add, 
+        sizeof(add),
+        (unsigned char*)msgtag,
+        TAGSIZE,
+        (unsigned char*)input, 
+        (unsigned char*)output );
+        memcpy(&outPtr[0], output, sizeof(output) - TAGSIZE);
+    }else{
+      err = mbedtls_gcm_crypt_and_tag(&aes_gcm,
+        MBEDTLS_GCM_ENCRYPT,
+        (unsigned int) messageLen,
+        iv, 
+        sizeof(iv),
+        add, 
+        sizeof(add),
+        (unsigned char*)input, 
+        (unsigned char*)output,
+        (const size_t)TAGSIZE, 
+        (unsigned char*)msgtag );
+      memcpy(&outPtr[0], output, sizeof(input));
+      memcpy(&outPtr[16], msgtag, TAGSIZE);
+      
+    }
+    
+    break;
+  }
   default:
     err = MBEDTLS_ERR_MD_FEATURE_UNAVAILABLE;
     break;
   }
 
-  mbedtls_aes_free( &aes );
+  if(mode == CM_GCM)
+    mbedtls_gcm_free( &aes_gcm );
+  else
+    mbedtls_aes_free( &aes );
   if (!err) {
     return outVar;
   } else {
